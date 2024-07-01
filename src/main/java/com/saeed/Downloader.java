@@ -5,84 +5,67 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Random;
+import java.util.concurrent.BrokenBarrierException;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 public class Downloader {
     private static final int NUMBER_OF_PARTS = 4;
     private static final long TIMEOUT_MILLIS = 4000;
     private static final List<TaskInfo> TASK_INFO_LIST = Collections.synchronizedList(new ArrayList<>(List.of(
-            new TaskInfo(100, true),
-            new TaskInfo(100, true),
-            new TaskInfo(100, true),
-            new TaskInfo(100, true)
+            new TaskInfo(1000, true),
+            new TaskInfo(2000, true),
+            new TaskInfo(4700, true),
+            new TaskInfo(100, false)
     )));
-
-
-    private static int completedParts = 0;
-    private static boolean errorOccurred = false;
 
     public static void main(String[] args) {
         cleanUp();
         System.out.println("---Cleanup finished---------------");
 
-        final List<Thread> downloadTasks = new ArrayList<>();
-        final Object lock = new Object();
+        ExecutorService executorService = Executors.newFixedThreadPool(NUMBER_OF_PARTS);
+        CyclicBarrier barrier = new CyclicBarrier(NUMBER_OF_PARTS + 1, () -> {
+            combineParts();
+            System.out.println("File download complete.");
+        });
 
-        for (int part = 1; part <= NUMBER_OF_PARTS; part++) {
-            Thread thread = new Thread(new DownloadTask(part, lock));
-            downloadTasks.add(thread);
-            thread.start();
+        for (int i = 1; i <= NUMBER_OF_PARTS; i++) {
+            executorService.submit(new DownloadTask(i, barrier));
         }
 
-        long startTime = System.currentTimeMillis();
-
-        synchronized (lock) {
-            while (completedParts < NUMBER_OF_PARTS && System.currentTimeMillis() - startTime < TIMEOUT_MILLIS && !errorOccurred) {
-                try {
-                    lock.wait(TIMEOUT_MILLIS - (System.currentTimeMillis() - startTime));
-                } catch (InterruptedException e) {
-                    System.out.println("Timeout or error occurred: " + e.getClass().getName());
-                }
-            }
-
-            if (completedParts < NUMBER_OF_PARTS || errorOccurred) {
-                System.out.println("Timeout reached or error occurred. Not all parts were downloaded.");
-                downloadTasks.stream()
-                        .filter(Thread::isAlive)
-                        .forEach(Thread::interrupt);
-            } else {
-                combineParts();
-                System.out.println("File download complete.");
-            }
+        try {
+            barrier.await(TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException | BrokenBarrierException | TimeoutException e) {
+            System.out.println("Timeout or error occurred: " + e.getClass().getName());
+        } finally {
+            executorService.shutdownNow();
+            deleteParts();
         }
-
-        deleteParts();
     }
 
     static class DownloadTask implements Runnable {
-        private final int partId;
-        private final Object lock;
+        private int partId;
+        private CyclicBarrier barrier;
 
-        public DownloadTask(int partId, Object lock) {
+        public DownloadTask(int partId, CyclicBarrier barrier) {
             this.partId = partId;
-            this.lock = lock;
+            this.barrier = barrier;
         }
 
         @Override
         public void run() {
-            boolean downloaded = downloadPart();
-
-            synchronized (lock) {
-                if (downloaded) {
-                    completedParts++;
-                    lock.notifyAll();
-                }else {
-                    errorOccurred = true;
-                    lock.notifyAll();
-                }
+            try {
+                downloadPart();
+                barrier.await();
+            } catch (InterruptedException | BrokenBarrierException e) {
+                System.out.println("Task " + partId + " : " + e.getClass().getName());
             }
         }
 
-        private boolean downloadPart() {
+        private void downloadPart() {
             try (BufferedWriter writer = new BufferedWriter(new FileWriter("part_" + partId + ".txt"))) {
                 writer.write("Content of part " + partId);
                 var taskInfo = TASK_INFO_LIST.isEmpty()
@@ -90,25 +73,22 @@ public class Downloader {
                         : TASK_INFO_LIST.removeFirst();
                 System.out.println("Part " + partId + " download started (" + taskInfo + " ).");
                 Thread.sleep(taskInfo.waitTime);
-                return checkTaskStatus(taskInfo.completionStatus);
+                checkTaskStatus(taskInfo.completionStatus);
             } catch (IOException | InterruptedException e) {
                 if (e instanceof InterruptedException) {
                     System.out.println("Download of part " + partId + " was interrupted.");
                 } else {
                     e.printStackTrace();
                 }
-                return false;
             }
         }
 
-        private boolean checkTaskStatus(boolean status) {
+        private void checkTaskStatus(boolean status) {
             if (!status) {
-                System.out.println("Part " + partId + " failed.");
+                Thread.currentThread().interrupt();
             } else {
                 System.out.println("Part " + partId + " downloaded.");
             }
-
-            return status;
         }
     }
 
